@@ -38,7 +38,9 @@ interval in whole seconds; it defaults to 5 and cannot be less than 1.
 
 Each output line contains the elapsed running time followed by the current,
 lowest, highest, and running average percentages for both values reported by
-the NT: audio-thread total usage and overall usage. Press Ctrl+C to stop.
+the NT: audio-thread total usage and overall usage. The script also wakes the
+NT immediately and once per minute to prevent the screensaver from affecting
+the measurements. Press Ctrl+C to stop.
 '''
 
 import argparse
@@ -51,6 +53,8 @@ import mido
 MANUFACTURER_ID = (0x00, 0x21, 0x27, 0x6D)
 CPU_USAGE_COMMAND = 0x62
 RESPONSE_TIMEOUT_SECONDS = 1.0
+WAKE_COMMAND = 0x07
+WAKE_INTERVAL_SECONDS = 60
 
 
 class RunningStatistics:
@@ -117,6 +121,11 @@ def request_cpu_usage(output_port, input_port, sysex_id):
     return None
 
 
+def wake_from_screensaver(output_port, sysex_id):
+    request = [0xF0, *MANUFACTURER_ID, sysex_id, WAKE_COMMAND, 0xF7]
+    output_port.send(mido.Message.from_bytes(request))
+
+
 def format_statistics(label, current, statistics):
     # CPU values range from 0 to 100, so reserve three characters for each
     # integer value. This keeps the following labels aligned as values grow.
@@ -139,32 +148,43 @@ def main():
     overall_statistics = RunningStatistics()
     start_time = time.monotonic()
     next_request_time = start_time
+    next_wake_time = start_time
 
     with mido.open_output(output_names[0]) as output_port, mido.open_input(input_names[0]) as input_port:
         print("Measuring CPU usage; press Ctrl+C to stop.")
         try:
             while True:
                 now = time.monotonic()
-                if now < next_request_time:
-                    time.sleep(next_request_time - now)
+                next_event_time = min(next_request_time, next_wake_time)
+                if now < next_event_time:
+                    time.sleep(next_event_time - now)
 
-                result = request_cpu_usage(output_port, input_port, arguments.sysex_id)
-                elapsed_seconds = int(time.monotonic() - start_time)
-                if result is not None:
-                    audio_usage, overall_usage = result
-                    audio_statistics.add(audio_usage)
-                    overall_statistics.add(overall_usage)
-                    print(
-                        f"{elapsed_seconds:8d}s  "
-                        + format_statistics("AUDIO", audio_usage, audio_statistics)
-                        + "   "
-                        + format_statistics("OVERALL ", overall_usage, overall_statistics)
-                    )
+                now = time.monotonic()
+                if now >= next_wake_time:
+                    wake_from_screensaver(output_port, arguments.sysex_id)
+                    # Maintain a minute-based schedule, but do not send a burst
+                    # of wake messages if the machine was suspended.
+                    while next_wake_time <= now:
+                        next_wake_time += WAKE_INTERVAL_SECONDS
 
-                # Keep the requested interval based on the original schedule, so
-                # response processing time does not accumulate as clock drift.
-                next_request_time += arguments.interval
-                next_request_time = max(next_request_time, time.monotonic())
+                if now >= next_request_time:
+                    result = request_cpu_usage(output_port, input_port, arguments.sysex_id)
+                    elapsed_seconds = int(time.monotonic() - start_time)
+                    if result is not None:
+                        audio_usage, overall_usage = result
+                        audio_statistics.add(audio_usage)
+                        overall_statistics.add(overall_usage)
+                        print(
+                            f"{elapsed_seconds:8d}s  "
+                            + format_statistics("AUDIO", audio_usage, audio_statistics)
+                            + "   "
+                            + format_statistics("OVERALL ", overall_usage, overall_statistics)
+                        )
+
+                    # Keep the requested interval based on the original schedule,
+                    # so response processing time does not accumulate as drift.
+                    next_request_time += arguments.interval
+                    next_request_time = max(next_request_time, time.monotonic())
         except KeyboardInterrupt:
             elapsed = time.monotonic() - start_time
             print(f"\nStopped after {int(elapsed)}s ({audio_statistics.count} samples).")
